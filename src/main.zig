@@ -45,7 +45,7 @@ const EventLoop = struct {
     }
 
     pub fn run(self: *EventLoop) !void {
-        while (true) {
+        while (!self.shutdown) {
             var events: [100]linux.epoll_event = undefined;
             // wait for events
             const num_fds = posix.epoll_wait(self.epoll_fd, &events, -1);
@@ -69,6 +69,8 @@ const EventHandler = struct {
 const TcpEchoer = struct {
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
+    connection_data: ?*EventHandler,
+    event_loop: ?*EventLoop,
     handle: ?EventLoop.Handle,
 
     pub fn init(allocator: std.mem.Allocator, connection: std.net.Server.Connection) !*TcpEchoer {
@@ -79,6 +81,8 @@ const TcpEchoer = struct {
             .allocator = allocator,
             .connection = connection,
             .handle = null,
+            .event_loop = null,
+            .connection_data = null,
         };
 
         return echoer;
@@ -87,6 +91,9 @@ const TcpEchoer = struct {
     fn deinit(self: *TcpEchoer) void {
         if (self.handle) |handle| {
             handle.deinit();
+        }
+        if (self.connection_data) |connection_data| {
+            self.allocator.destroy(connection_data);
         }
         self.connection.stream.close();
         self.allocator.destroy(self);
@@ -101,7 +108,9 @@ const TcpEchoer = struct {
         };
 
         const event_loop_handle = try event_loop.register(self.connection.stream.handle, connection_data);
+        self.event_loop = event_loop;
         self.handle = event_loop_handle;
+        self.connection_data = connection_data;
     }
 
     pub fn echo(userdata: ?*anyopaque) !void {
@@ -115,6 +124,10 @@ const TcpEchoer = struct {
         if (n == 0) {
             self.deinit();
             return error.ConnectionClosed;
+        }
+
+        if (std.mem.eql(u8, buf[0..n], "exit\n")) {
+            self.event_loop.?.shutdown = true;
         }
 
         _ = try self.connection.stream.write(buf[0..n]);
@@ -131,6 +144,8 @@ const TcpConnectionAcceptor = struct {
         for (self.echoers.items) |echoer| {
             echoer.deinit();
         }
+
+        self.echoers.deinit();
     }
 
     fn acceptTCPConnection(userdata: ?*anyopaque) anyerror!void {
@@ -172,6 +187,8 @@ pub fn main() !void {
         .server = &tcp_server,
         .echoers = std.ArrayList(*TcpEchoer).init(allocator),
     };
+
+    defer tcp_connection_acceptor.deinit();
 
     const listener_data = EventHandler{
         .data = &tcp_connection_acceptor,
