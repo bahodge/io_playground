@@ -4,29 +4,51 @@ const posix = std.posix;
 
 const EventLoop = struct {
     epoll_fd: i32,
+    // Unowned pointers
+    handlers: std.ArrayList(*const EventHandler),
     shutdown: bool = false,
 
     const Handle = struct {
-        epoll_fd: i32,
         fd: i32,
+        // Unowned pointer
+        handler: *const EventHandler,
+        event_loop: *EventLoop,
 
         pub fn deinit(self: *const @This()) void {
-            posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, self.fd, null) catch |err| {
+            for (self.event_loop.handlers.items, 0..) |handler, i| {
+                if (handler == self.handler) {
+                    _ = self.event_loop.handlers.swapRemove(i);
+                    break;
+                }
+            }
+
+            posix.epoll_ctl(self.event_loop.epoll_fd, linux.EPOLL.CTL_DEL, self.fd, null) catch |err| {
                 std.debug.panic("failed to unregister with epoll {any}", .{err});
             };
+
+            if (self.handler.deinit) |f| {
+                f(self.handler.data);
+            }
         }
     };
 
-    pub fn init() !EventLoop {
+    pub fn init(allocator: std.mem.Allocator) !EventLoop {
         const epoll_fd = try posix.epoll_create1(0);
 
         return EventLoop{
             .epoll_fd = epoll_fd,
+            .handlers = std.ArrayList(*const EventHandler).init(allocator),
         };
     }
 
     pub fn deinit(self: *EventLoop) void {
         std.posix.close(self.epoll_fd);
+        for (self.handlers.items) |handler| {
+            if (handler.deinit) |f| {
+                f(handler.data);
+            }
+        }
+        self.handlers.deinit();
     }
 
     // handler must be valid for duration of file descriptor
@@ -36,11 +58,15 @@ const EventLoop = struct {
             .data = .{ .ptr = @intFromPtr(handler) },
         };
 
+        try self.handlers.append(handler);
+        errdefer _ = self.handlers.pop();
+
         try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &event);
 
         return Handle{
-            .epoll_fd = self.epoll_fd,
+            .event_loop = self,
             .fd = fd,
+            .handler = handler,
         };
     }
 
@@ -64,6 +90,7 @@ const EpollCallback = *const fn (?*anyopaque) anyerror!void;
 const EventHandler = struct {
     data: ?*anyopaque,
     callback: EpollCallback,
+    deinit: ?*const fn (?*anyopaque) void,
 };
 
 const TcpEchoer = struct {
@@ -89,22 +116,29 @@ const TcpEchoer = struct {
     }
 
     fn deinit(self: *TcpEchoer) void {
-        if (self.handle) |handle| {
-            handle.deinit();
-        }
+        self.connection.stream.close();
+
         if (self.connection_data) |connection_data| {
             self.allocator.destroy(connection_data);
         }
-        self.connection.stream.close();
+
         self.allocator.destroy(self);
     }
 
     pub fn register(self: *TcpEchoer, event_loop: *EventLoop) !void {
         const connection_data = try self.allocator.create(EventHandler);
         errdefer self.allocator.destroy(connection_data);
+
+        const opaque_deinit = struct {
+            fn f(data: ?*anyopaque) void {
+                const echoer: *TcpEchoer = @ptrCast(@alignCast(data));
+                echoer.deinit();
+            }
+        }.f;
         connection_data.* = .{
             .data = self,
             .callback = TcpEchoer.echo,
+            .deinit = opaque_deinit,
         };
 
         const event_loop_handle = try event_loop.register(self.connection.stream.handle, connection_data);
@@ -122,7 +156,7 @@ const TcpEchoer = struct {
         const n = try self.connection.stream.read(&buf);
 
         if (n == 0) {
-            self.deinit();
+            self.handle.?.deinit();
             return error.ConnectionClosed;
         }
 
@@ -138,15 +172,6 @@ const TcpConnectionAcceptor = struct {
     allocator: std.mem.Allocator,
     server: *std.net.Server,
     event_loop: *EventLoop,
-    echoers: std.ArrayList(*TcpEchoer),
-
-    pub fn deinit(self: *TcpConnectionAcceptor) void {
-        for (self.echoers.items) |echoer| {
-            echoer.deinit();
-        }
-
-        self.echoers.deinit();
-    }
 
     fn acceptTCPConnection(userdata: ?*anyopaque) anyerror!void {
         const self: *TcpConnectionAcceptor = @ptrCast(@alignCast(userdata));
@@ -158,9 +183,6 @@ const TcpConnectionAcceptor = struct {
             return err;
         };
         errdefer echoer.deinit();
-
-        try self.echoers.append(echoer);
-        errdefer _ = self.echoers.pop();
 
         try echoer.register(self.event_loop);
     }
@@ -178,21 +200,19 @@ pub fn main() !void {
     });
     defer tcp_server.deinit();
 
-    var event_loop = try EventLoop.init();
+    var event_loop = try EventLoop.init(allocator);
     defer event_loop.deinit();
 
     var tcp_connection_acceptor = TcpConnectionAcceptor{
         .allocator = allocator,
         .event_loop = &event_loop,
         .server = &tcp_server,
-        .echoers = std.ArrayList(*TcpEchoer).init(allocator),
     };
-
-    defer tcp_connection_acceptor.deinit();
 
     const listener_data = EventHandler{
         .data = &tcp_connection_acceptor,
         .callback = TcpConnectionAcceptor.acceptTCPConnection,
+        .deinit = null,
     };
 
     const handle = try event_loop.register(tcp_server.stream.handle, &listener_data);
