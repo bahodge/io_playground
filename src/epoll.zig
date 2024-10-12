@@ -188,7 +188,7 @@ const TcpConnectionAcceptor = struct {
     }
 };
 
-pub fn do_epoll() !void {
+pub fn run() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -198,6 +198,7 @@ pub fn do_epoll() !void {
         .reuse_port = true,
         .reuse_address = true,
     });
+
     defer tcp_server.deinit();
 
     var event_loop = try EventLoop.init(allocator);
