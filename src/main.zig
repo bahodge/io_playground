@@ -9,7 +9,7 @@ pub fn main() !void {
     //
     // try epoll.run();
 
-    try epoll2.run();
+    // try epoll2.run();
 
     // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     // defer {
