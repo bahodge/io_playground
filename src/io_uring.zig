@@ -138,5 +138,6 @@ pub fn main() !void {
 
         try benchmarkIOUringNEntries(allocator, data, 1);
         try benchmarkIOUringNEntries(allocator, data, 128);
+        try benchmarkIOUringNEntries(allocator, data, 256);
     }
 }
