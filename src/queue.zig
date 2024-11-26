@@ -49,6 +49,10 @@ pub fn Queue(comptime T: type) type {
             return node;
         }
 
+        pub fn reset(self: *Self) void {
+            self.* = Self{ .head = null, .count = 0 };
+        }
+
         pub fn print(self: Self) void {
             var current = self.head;
             var pos: u32 = 0;
@@ -68,17 +72,23 @@ test "queue" {
     var b = Q.Node{ .data = 2 };
     var c = Q.Node{ .data = 3 };
 
+    // enqueue a bunch of items
     q.enqueue(&a);
     q.enqueue(&b);
     q.enqueue(&c);
     try std.testing.expectEqual(3, q.count);
     q.print();
 
+    // remove the item at the head of the queue
     const a_dequeued = q.dequeue();
     std.debug.print("queue {any}\n", .{q});
     try std.testing.expect(a_dequeued.?.data == a.data);
 
     try std.testing.expectEqual(2, q.count);
+    q.print();
 
+    // reset the queue (drop all refs)
+    q.reset();
+    try std.testing.expectEqual(0, q.count);
     q.print();
 }
