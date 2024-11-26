@@ -1,7 +1,10 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
-const IoUring = std.os.linux.IoUring;
+const linux = std.os.linux;
+const IoUring = linux.IoUring;
+const io_uring_sqe = linux.io_uring_sqe;
+const io_uring_cqe = linux.io_uring_cqe;
 
 const ConnectionState = enum(u8) {
     ready,
@@ -22,11 +25,6 @@ const Connection = struct {
         };
     }
 
-    pub fn tick(self: *Connection) !void {
-        // if there is a
-        _ = self;
-    }
-
     pub fn close(self: *Connection) void {
         if (self.state == .closed) return;
         posix.close(self.socket);
@@ -34,7 +32,7 @@ const Connection = struct {
     }
 };
 
-var conn_id: u32 = 10;
+var conn_id: u32 = 1;
 
 const Bus = struct {
     allocator: std.mem.Allocator,
@@ -66,62 +64,79 @@ const Bus = struct {
 
     pub fn run(self: *Bus) !void {
         std.debug.print("bus is running!\n", .{});
-        var cqes: [256]std.os.linux.io_uring_cqe = undefined;
+        var cqes: [256]linux.io_uring_cqe = undefined;
+        var buf: [1024]u8 = undefined;
 
-        while (true) {
+        main: while (true) {
             // wait for some connections before trying to do any work
             if (self.connections.items.len == 0) std.time.sleep(100 * std.time.ns_per_ms);
             if (!self.connections_mutex.tryLock()) continue;
             defer self.connections_mutex.unlock();
 
-            var buf: [1024]u8 = undefined;
-            var read_buf = IoUring.ReadBuffer{
-                .buffer = &buf,
-            };
-            read_buf.buffer = &buf;
-            inner: for (self.connections.items) |conn| {
+            // if there are any submitted or completed events, we should try to process all of those events
+            // before trying to submitting/completing any more. If we can't process those events, then lets
+            // collect some more events
+
+            for (self.connections.items, 0..) |conn, i| {
                 switch (conn.state) {
                     .waiting => continue,
                     .ready => {
-                        // var read_buf: [1024]u8 = undefined;
-                        // check if there is data bound for this connection to be written
-                        // read from this socket
-                        var sqe = try self.ring.read(@intFromPtr(conn), conn.socket, read_buf, 0);
-                        sqe.addr = @intFromPtr(&buf);
-                        // conn.state = .waiting;
+                        const read_buf = IoUring.ReadBuffer{
+                            .buffer = &buf,
+                        };
+
+                        // check if there is a message to be written to this connection
+                        _ = try self.ring.read(@intFromPtr(conn), conn.socket, read_buf, 0);
+                        _ = try self.ring.timeout(@intFromPtr(conn), &linux.kernel_timespec{ .tv_sec = 5, .tv_nsec = 0 }, 1, 0);
+                        conn.state = .waiting;
                     },
                     .closed => {
-                        // NOTE: this isn't a super great way to handle closed connections, would probably be better
-                        // to have a seperate loop prune closed connections
+                        // remove the connection and start again
+                        conn.close();
+                        _ = self.connections.swapRemove(i);
                         // self.removeConnection(conn.id);
-                        break :inner;
+                        continue :main;
                     },
                 }
             }
 
             // submit all the events
             _ = try self.ring.submit();
-
             const done = try self.ring.copy_cqes(&cqes, 0);
 
-            for (cqes[0..done]) |cqe| {
+            for (cqes[0..done], 0..) |cqe, i| {
+                // NOTE: catchall for errors. If any error, just queue the conn for closing
                 if (cqe.res < 0) {
+                    std.debug.print("error cqe {any}\n", .{cqe});
+                    const conn: *Connection = @ptrFromInt(cqe.user_data);
+                    // std.debug.print("error cqe connection {any}\n", .{conn});
+                    // _ = try posix.send(conn.socket, "bye", 0);
+                    // conn.state = .closed;
+                    conn.close();
+
                     continue;
                 }
 
                 if (cqe.user_data != 0) {
-                    for (self.connections.items) |conn| {
-                        const ptr: *Connection = @ptrFromInt(cqe.user_data);
-                        if (ptr == conn) {
-                            std.debug.print("cqe {any}\n", .{cqe});
-                            std.debug.print("conn {any}\n", .{conn});
-                            std.debug.print("buf {s}\n", .{buf[0..@intCast(cqe.res)]});
-                            break;
-                        }
+                    // i would really want this to be an "Event" that contains context, data and other helpful stuff
+                    const conn: *Connection = @ptrFromInt(cqe.user_data);
+                    // we don't care about this connection and we are going to drop it
+                    if (conn.state == .closed) {
+                        // std.debug.print("conn is closed {any}\n", .{conn.id});
+                        continue;
+                    }
+
+                    // immediately swap states to ready to receive the next results
+                    conn.state = .ready;
+
+                    if (cqe.res > 0) {
+                        // std.debug.print("cqe {any}\n", .{cqe});
+                        // std.debug.print("conn {any}\n", .{conn});
+                        std.debug.print("conn {d} cqe_idx: {d} buf {s}\n", .{ conn.id, i, buf[0..@intCast(cqe.res)] });
                     }
                 }
                 // find the matching connection and have the connection handle the event
-                std.debug.print("cqe done {any}\n", .{cqe});
+                // std.debug.print("cqe done {any}\n", .{cqe});
             }
         }
     }
@@ -132,12 +147,13 @@ const Bus = struct {
 
         const conn = try self.allocator.create(Connection);
         conn.* = Connection.new(conn_id, socket);
+        conn_id += 1;
         try self.connections.append(conn);
     }
 
     pub fn removeConnection(self: *Bus, id: u32) void {
-        self.connections_mutex.lock();
-        defer self.connections_mutex.unlock();
+        // self.connections_mutex.lock();
+        // defer self.connections_mutex.unlock();
 
         for (self.connections.items, 0..) |conn, idx| {
             if (conn.id != id) continue;
@@ -173,7 +189,7 @@ fn listen() !void {
     defer ring.deinit();
 
     // completion queue events (cqes)
-    const cqes = try ring_allocator.alloc(std.os.linux.io_uring_cqe, entries_num);
+    const cqes = try ring_allocator.alloc(linux.io_uring_cqe, entries_num);
     defer ring_allocator.free(cqes);
 
     var bus_gpa = std.heap.GeneralPurposeAllocator(.{}){};
