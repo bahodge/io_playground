@@ -1757,13 +1757,105 @@ pub const IO = struct {
 const Server = struct {
     const Self = @This();
 
-    io: *IO,
+    const Connection = struct {
+        server: *Server,
+        socket: posix.socket_t,
 
-    pub fn tick(self: *Self) void {
-        _ = self;
+        recv_submitted: bool,
+        recv_completion: *IO.Completion,
+        recv_buffer: [1024]u8,
+
+        pub fn new(socket: posix.socket_t) Connection {
+            return Connection{
+                .socket = socket,
+                .recv_submitted = false,
+                .recv_completion = undefined,
+                .recv_buffer = undefined,
+            };
+        }
+
+        pub fn tick(conn: *Connection) !void {
+            // don't do anything if the connection has already submitted
+            // TODO: handle writing to this connection (can do with a mailbox or something)
+            if (conn.recv_submitted) return;
+            // submit a recv io op
+
+            conn.server.io.recv(
+                *Connection,
+                conn,
+                Connection.on_receive,
+                conn.recv_completion,
+                conn.socket,
+                &conn.recv_buffer,
+            );
+        }
+
+        pub fn on_receive(conn: *Connection, comp: *IO.Completion, res: IO.RecvError!usize) void {
+            const bytes = res catch return;
+            _ = comp;
+            _ = conn;
+
+            std.debug.print("received some bytes! {any}\n", .{bytes});
+        }
+    };
+
+    io: *IO,
+    listener: posix.socket_t,
+    connections: std.ArrayList(Connection),
+    connections_mutex: std.Thread.Mutex,
+
+    accept_submitted: bool,
+    accept_completion: *IO.Completion,
+
+    pub fn init(io: *IO, listener: posix.socket_t, allocator: std.mem.Allocator) Self {
+        return Self{
+            .io = io,
+            .listener = listener,
+            .connections = std.ArrayList(Connection).init(allocator),
+            .connections_mutex = std.Thread.Mutex{},
+        };
     }
 
-    pub fn log(self: *Self, comp: *IO.Completion, res: IO.WriteError!usize) void {
+    pub fn deinit(self: *Self) void {
+        self.connections.deinit();
+    }
+
+    pub fn tick(self: *Self) !void {
+        if (self.connections.items.len == 0) std.time.sleep(100 * std.time.ns_per_ms);
+        if (!self.connections_mutex.tryLock()) return;
+        defer self.connections_mutex.unlock();
+
+        // try to lock the sockets list so we can add a new socket
+        for (self.connections.items) |*conn| {
+            // enqueue a recv operation
+            try conn.tick();
+        }
+
+        // accept new connection
+        // var accept_completion: IO.Completion = undefined;
+        // var timeout_completion: IO.Completion = undefined;
+        // self.io.accept(*Server, self, Server.accept_callback, &accept_completion, self.listener);
+        // self.io.timeout(*Server, self, Server.timeout_callback, &timeout_completion, 1_000_000_000);
+    }
+
+    pub fn timeout_callback(self: *Self, comp: *IO.Completion, res: IO.TimeoutError!void) void {
+        _ = self;
+        _ = comp;
+        _ = res catch unreachable;
+
+        std.debug.print("something timed out\n", .{});
+    }
+
+    pub fn accept_callback(self: *Self, comp: *IO.Completion, res: IO.AcceptError!i32) void {
+        _ = self;
+        _ = comp;
+        _ = res catch unreachable;
+
+        // TODO: add new connection
+        std.debug.print("accepted a connection stuff\n", .{});
+    }
+
+    pub fn write_callback(self: *Self, comp: *IO.Completion, res: IO.WriteError!usize) void {
         _ = self;
         _ = comp;
         _ = res catch unreachable;
@@ -1777,14 +1869,32 @@ pub fn main() !void {
     var io = try IO.init(8, 0);
     defer io.deinit();
 
-    var server = Server{
-        .io = &io,
-    };
-    const stdout = std.io.getStdOut();
-    var completion: IO.Completion = undefined;
+    const address = try std.net.Address.parseIp("127.0.0.1", 8000);
+    std.log.debug("listening on {s}:{d}", .{ "127.0.0.1", 8000 });
+
+    const socket_type: u32 = posix.SOCK.STREAM;
+    const protocol = posix.IPPROTO.TCP;
+    const listener = try posix.socket(address.any.family, socket_type, protocol);
+    defer posix.close(listener);
+
+    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try posix.bind(listener, &address.any, address.getOsSockLen());
+    try posix.listen(listener, 128);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = Server.init(&io, listener, allocator);
+    defer server.deinit();
+
+    // const stdout = std.io.getStdOut();
+    // var completion: IO.Completion = undefined;
 
     while (true) {
-        io.write(*Server, &server, Server.log, &completion, stdout.handle, "hello!\n", 0);
+        try server.tick();
+
+        // io.write(*Server, &server, Server.log, &completion, stdout.handle, "hello!\n", 0);
 
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
