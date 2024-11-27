@@ -1754,69 +1754,180 @@ pub const IO = struct {
     }
 };
 
+const ConnectionState = enum {
+    ready,
+    close,
+    closed,
+};
+
 const Server = struct {
     const Self = @This();
 
     const Connection = struct {
         server: *Server,
         socket: posix.socket_t,
+        state: ConnectionState,
 
         recv_submitted: bool,
         recv_completion: *IO.Completion,
         recv_buffer: [1024]u8,
 
-        pub fn new(socket: posix.socket_t) Connection {
+        close_submitted: bool,
+        close_completion: *IO.Completion,
+
+        allocator: std.mem.Allocator,
+
+        pub fn init(server: *Server, socket: posix.socket_t, allocator: std.mem.Allocator) Connection {
+            const recv_completion = allocator.create(IO.Completion) catch unreachable;
+            errdefer allocator.destroy(recv_completion);
+
+            const close_completion = allocator.create(IO.Completion) catch unreachable;
+            errdefer allocator.destroy(close_completion);
+
             return Connection{
+                .server = server,
                 .socket = socket,
+                .state = .ready,
                 .recv_submitted = false,
-                .recv_completion = undefined,
+                .recv_completion = recv_completion,
                 .recv_buffer = undefined,
+                .close_submitted = false,
+                .close_completion = close_completion,
+
+                .allocator = allocator,
             };
         }
 
+        pub fn deinit(self: *Connection) void {
+            self.allocator.destroy(self.recv_completion);
+            self.allocator.destroy(self.close_completion);
+        }
+
         pub fn tick(conn: *Connection) !void {
+            switch (conn.state) {
+                .close => {
+                    if (!conn.close_submitted) {
+                        conn.server.io.close(
+                            *Connection,
+                            conn,
+                            Connection.on_close,
+                            conn.close_completion,
+                            conn.socket,
+                        );
+                    }
+                    // break out of the tick
+                    return;
+                },
+                .closed => return,
+                else => {},
+            }
+
             // don't do anything if the connection has already submitted
             // TODO: handle writing to this connection (can do with a mailbox or something)
-            if (conn.recv_submitted) return;
-            // submit a recv io op
+            if (!conn.recv_submitted) {
+                std.debug.print("submitting recv\n", .{});
+                // submit a recv io op
+                conn.server.io.recv(
+                    *Connection,
+                    conn,
+                    Connection.on_receive,
+                    conn.recv_completion,
+                    conn.socket,
+                    &conn.recv_buffer,
+                );
 
-            conn.server.io.recv(
-                *Connection,
-                conn,
-                Connection.on_receive,
-                conn.recv_completion,
-                conn.socket,
-                &conn.recv_buffer,
-            );
+                std.debug.print("submitted recv\n", .{});
+                conn.recv_submitted = true;
+
+                // // set a timeout to recv
+                // conn.server.io.timeout(
+                //     *Connection,
+                //     conn,
+                //     Connection.on_receive_timeout,
+                //     // We use `recv_completion` for the connection `timeout()` and `connect()` calls
+                //     conn.recv_completion,
+                //     @as(u63, @intCast(1000 * std.time.ns_per_ms)),
+                // );
+            }
+        }
+
+        pub fn on_receive_timeout(conn: *Connection, comp: *IO.Completion, res: IO.TimeoutError!void) void {
+            _ = comp;
+            // _ = conn;
+            _ = res catch 0;
+
+            conn.recv_submitted = false;
+            conn.recv_buffer = undefined;
+            // conn.recv_completion = undefined;
+
+            std.debug.print("recv timeout!\n", .{});
+        }
+
+        pub fn on_close(conn: *Connection, comp: *IO.Completion, res: IO.CloseError!void) void {
+            res catch {};
+            _ = comp;
+            // _ = conn;
+
+            // this means that the connection has been closed by the peer and we should
+            // shutdown the connection
+            conn.state = .closed;
+
+            std.debug.print("closed connection\n", .{});
+
+            conn.close_submitted = false;
         }
 
         pub fn on_receive(conn: *Connection, comp: *IO.Completion, res: IO.RecvError!usize) void {
             const bytes = res catch return;
             _ = comp;
-            _ = conn;
+            // _ = conn;
 
-            std.debug.print("received some bytes! {any}\n", .{bytes});
+            // this means that the connection has been closed by the peer and we should
+            // shutdown the connection
+            if (bytes == 0) {
+                conn.state = .close;
+                return;
+            }
+
+            std.debug.print("received {any} bytes! {any}\n", .{ bytes, conn.recv_buffer[0..bytes] });
+
+            conn.recv_submitted = false;
+            conn.recv_buffer = undefined;
+            // conn.recv_completion = undefined;
         }
     };
 
     io: *IO,
     listener: posix.socket_t,
-    connections: std.ArrayList(Connection),
+    connections: std.ArrayList(*Connection),
     connections_mutex: std.Thread.Mutex,
 
     accept_submitted: bool,
     accept_completion: *IO.Completion,
+    allocator: std.mem.Allocator,
 
-    pub fn init(io: *IO, listener: posix.socket_t, allocator: std.mem.Allocator) Self {
+    pub fn init(io: *IO, listener: posix.socket_t, allocator: std.mem.Allocator) !Self {
+        const accept_completion = try allocator.create(IO.Completion);
+        errdefer allocator.destroy(accept_completion);
+
         return Self{
             .io = io,
             .listener = listener,
-            .connections = std.ArrayList(Connection).init(allocator),
+            .connections = std.ArrayList(*Connection).init(allocator),
             .connections_mutex = std.Thread.Mutex{},
+            .accept_submitted = false,
+            .accept_completion = accept_completion,
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.connections.items) |ptr| {
+            ptr.deinit();
+            self.allocator.destroy(ptr);
+        }
+
+        self.allocator.destroy(self.accept_completion);
         self.connections.deinit();
     }
 
@@ -1825,37 +1936,77 @@ const Server = struct {
         if (!self.connections_mutex.tryLock()) return;
         defer self.connections_mutex.unlock();
 
-        // try to lock the sockets list so we can add a new socket
-        for (self.connections.items) |*conn| {
-            // enqueue a recv operation
+        // prune all closed connections
+        for (self.connections.items, 0..) |conn, i| {
+            if (conn.state == .closed) {
+                _ = self.connections.swapRemove(i);
+
+                conn.deinit();
+                self.allocator.destroy(conn);
+            }
+        }
+
+        for (self.connections.items) |conn| {
+            // skip the connection
+            if (conn.state == .closed) {
+                continue;
+            }
             try conn.tick();
         }
 
         // accept new connection
         // var accept_completion: IO.Completion = undefined;
         // var timeout_completion: IO.Completion = undefined;
-        // self.io.accept(*Server, self, Server.accept_callback, &accept_completion, self.listener);
-        // self.io.timeout(*Server, self, Server.timeout_callback, &timeout_completion, 1_000_000_000);
+        if (!self.accept_submitted) {
+            // std.debug.print("self.accept_completion {any}\n", .{self.accept_completion});
+            self.io.accept(*Server, self, Server.on_accept, self.accept_completion, self.listener);
+            self.accept_submitted = true;
+
+            // self.io.timeout(*Server, self, Server.on_accept_timeout, self.accept_completion, 1_000_000_000);
+        }
     }
 
-    pub fn timeout_callback(self: *Self, comp: *IO.Completion, res: IO.TimeoutError!void) void {
-        _ = self;
+    pub fn on_accept_timeout(self: *Self, comp: *IO.Completion, res: IO.TimeoutError!void) void {
         _ = comp;
-        _ = res catch unreachable;
+        res catch |err| {
+            std.debug.print("err {any}\n", .{err});
+        };
 
-        std.debug.print("something timed out\n", .{});
+        self.accept_submitted = false;
+        // self.accept_completion = undefined;
+
+        std.debug.print("accept something timed out\n", .{});
     }
 
-    pub fn accept_callback(self: *Self, comp: *IO.Completion, res: IO.AcceptError!i32) void {
-        _ = self;
+    pub fn on_accept(self: *Self, comp: *IO.Completion, res: IO.AcceptError!posix.socket_t) void {
+        // _ = self;
         _ = comp;
-        _ = res catch unreachable;
+        const socket = res catch 0;
 
-        // TODO: add new connection
-        std.debug.print("accepted a connection stuff\n", .{});
+        self.accept_submitted = false;
+        // we should create a new connection
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+
+        std.debug.print("accepted: socket {any}\n", .{socket});
+
+        const conn = self.allocator.create(Connection) catch unreachable;
+        conn.* = Connection.init(self, socket, self.allocator);
+
+        self.connections.append(conn) catch unreachable;
+
+        std.debug.print("accepted a connection\n", .{});
     }
 
-    pub fn write_callback(self: *Self, comp: *IO.Completion, res: IO.WriteError!usize) void {
+    // pub fn timeout_callback(self: *Self, comp: *IO.Completion, res: IO.TimeoutError!void) void {
+    //     _ = self;
+    //     _ = comp;
+    //     _ = res catch unreachable;
+    //
+    //     std.debug.print("something timed out\n", .{});
+    // }
+
+    pub fn on_write(self: *Self, comp: *IO.Completion, res: IO.WriteError!usize) void {
         _ = self;
         _ = comp;
         _ = res catch unreachable;
@@ -1885,8 +2036,14 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var server = Server.init(&io, listener, allocator);
+    var server = try Server.init(&io, listener, allocator);
     defer server.deinit();
+
+    // server.init(allocator)
+    //      self.allocator = allocator;
+    // on_accept
+    //     Connection.init(self.allocator, socket);
+    //     Connection.deinit();
 
     // const stdout = std.io.getStdOut();
     // var completion: IO.Completion = undefined;
