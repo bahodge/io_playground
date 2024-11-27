@@ -2039,20 +2039,8 @@ pub fn main() !void {
     var server = try Server.init(&io, listener, allocator);
     defer server.deinit();
 
-    // server.init(allocator)
-    //      self.allocator = allocator;
-    // on_accept
-    //     Connection.init(self.allocator, socket);
-    //     Connection.deinit();
-
-    // const stdout = std.io.getStdOut();
-    // var completion: IO.Completion = undefined;
-
     while (true) {
         try server.tick();
-
-        // io.write(*Server, &server, Server.log, &completion, stdout.handle, "hello!\n", 0);
-
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
 }
